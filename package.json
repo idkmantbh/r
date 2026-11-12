@@ -1,0 +1,16 @@
+{
+  "name": "remotebridge-bot",
+  "version": "1.0.0",
+  "description": "Discord <-> Minecraft WebSocket bridge",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "ws": "^8.16.0",
+    "dotenv": "^16.4.1",
+    "omggif": "^1.0.10",
+    "jimp": "^0.22.12"
+  }
+}
