@@ -10,13 +10,20 @@ const crypto = require('crypto');
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID    = process.env.CHANNEL_ID;
 const WEBHOOK_URL   = process.env.WEBHOOK_URL;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
+const adminSessions = new Set();
+function newAdminSession() { const t = crypto.randomBytes(16).toString('hex'); adminSessions.add(t); return t; }
+function checkAdminSession(req) {
+    if (!ADMIN_PASSWORD) return false;
+    const cookie = (req.headers.cookie || '').split(';').map(c => c.trim()).find(c => c.startsWith('rb_admin='));
+    if (!cookie) return false;
+    return adminSessions.has(cookie.slice(9));
+}
 
 if (!DISCORD_TOKEN || DISCORD_TOKEN === 'YOUR_BOT_TOKEN_HERE') {
-    console.error('[RemoteBridge] ERROR: Set DISCORD_TOKEN in your .env file!');
     process.exit(1);
 }
 if (!CHANNEL_ID || CHANNEL_ID === 'YOUR_CHANNEL_ID_HERE') {
-    console.error('[RemoteBridge] ERROR: Set CHANNEL_ID in your .env file!');
     process.exit(1);
 }
 
@@ -82,7 +89,6 @@ function maybeSendUpdate(id, reportedHash) {
     const latest = getLatestMod();
     if (!latest) return false;
     if (!BASE_URL) {
-        console.warn('[RemoteBridge] mods/remotebridge-latest.jar present but no public URL could be determined (set BASE_URL).');
         return false;
     }
     if (reportedHash === latest.hash) return false;
@@ -125,6 +131,7 @@ function checkWatchKey(id, key) {
 // /watch/<id> link, so "open full view" from a tile can reuse it.
 let dashboardKeyStore = null; // { key, expires }
 const dashboardViewers = new Set(); // ws connections on /dashboard-ws
+const adminViewers = new Set();
 
 function newDashboardKey() {
     const key = crypto.randomBytes(12).toString('hex');
@@ -139,9 +146,11 @@ function checkDashboardKey(key) {
 }
 
 function broadcastDashboard(obj) {
-    if (dashboardViewers.size === 0) return;
     const msg = JSON.stringify(obj);
     for (const v of dashboardViewers) {
+        if (v.readyState === WebSocket.OPEN) v.send(msg);
+    }
+    for (const v of adminViewers) {
         if (v.readyState === WebSocket.OPEN) v.send(msg);
     }
 }
@@ -152,7 +161,7 @@ function broadcastDashboard(obj) {
 function syncWatch(id) {
     const inst = instances.get(id);
     if (!inst) return;
-    const want = (watchers.get(id)?.size || 0) > 0 || dashboardViewers.size > 0;
+    const want = (watchers.get(id)?.size || 0) > 0 || dashboardViewers.size > 0 || adminViewers.size > 0;
     if (want === inst.watching) return;
     inst.watching = want;
     sendToMinecraft({ type: want ? 'watch_start' : 'watch_stop' }, id);
@@ -185,7 +194,6 @@ function renumber(fromId, toId) {
     if (w) { watchers.delete(fromId); watchers.set(toId, w); }
     const k = watchKeys.get(fromId);
     if (k) { watchKeys.delete(fromId); watchKeys.set(toId, k); }
-    console.log(`[RemoteBridge] Instance #${fromId} reconnected — sliding back into #${toId}.`);
     broadcastDashboard({ type: 'instance_disconnected', id: fromId });
     broadcastDashboard({ type: 'instance_connected', id: toId, username: inst.username, status: inst.lastStatus });
     syncWatch(toId);
@@ -574,6 +582,212 @@ function dashboardPage() {
 
 // ── HTTP + WebSocket Server (shared port for Render) ─────────────────────────
 
+function adminLoginPage(err) {
+    return `<!doctype html><html><head><meta charset="utf-8"><title>RemoteBridge Admin</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box}body{background:#0b0b0d;color:#e8e8ea;font:14px/1.5 ui-monospace,monospace;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{background:#141416;border:1px solid #2a2a2e;border-radius:12px;padding:32px;width:320px}
+h1{margin:0 0 24px;font-size:18px;color:#fff}
+input{width:100%;background:#1b1b1e;border:1px solid #2a2a2e;border-radius:7px;color:#e8e8ea;font:inherit;padding:10px 12px;margin-bottom:12px}
+button{width:100%;background:#5b8cff;border:none;border-radius:7px;color:#fff;font:600 14px ui-monospace,monospace;padding:11px;cursor:pointer}
+button:hover{background:#6f9dff}.err{color:#e2493d;font-size:12px;margin-bottom:10px}
+</style></head><body>
+<div class="box"><h1>RemoteBridge Admin</h1>
+${err ? `<div class="err">Wrong password.</div>` : ''}
+<form method="POST" action="/admin/login">
+<input type="password" name="password" placeholder="Password" autofocus>
+<button type="submit">Sign in</button>
+</form></div></body></html>`;
+}
+
+function adminPanelPage() {
+    return `<!doctype html><html><head><meta charset="utf-8"><title>RemoteBridge Admin Panel</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box}
+:root{--bg:#0b0b0d;--panel:#141416;--panel2:#1b1b1e;--border:#2a2a2e;--text:#e8e8ea;--muted:#8a8a90;--accent:#5b8cff;--green:#2ecc71;--red:#e2493d}
+body{background:var(--bg);color:var(--text);font:13px/1.45 ui-monospace,monospace;margin:0;min-height:100vh}
+header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
+header h1{margin:0;font-size:15px;font-weight:600}
+.status{font-size:12px;color:var(--muted)}
+.conn{color:var(--green)}
+main{display:grid;grid-template-columns:260px 1fr;min-height:calc(100vh - 49px)}
+.sidebar{background:var(--panel);border-right:1px solid var(--border);padding:12px;overflow-y:auto}
+.sidebar h2{margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.inst{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
+.inst:hover,.inst.active{border-color:var(--accent)}
+.inst .name{font-weight:600;margin-bottom:3px}
+.inst .info{font-size:11px;color:var(--muted)}
+.inst .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:5px;box-shadow:0 0 4px var(--green)}
+#noInst{color:var(--muted);font-size:12px}
+.content{padding:16px;overflow-y:auto}
+.section{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px}
+.section h2{margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.btnrow{display:flex;flex-wrap:wrap;gap:6px}
+.btnrow button,.inline button{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--border);border-radius:7px;padding:7px 12px;cursor:pointer;white-space:nowrap}
+.btnrow button:hover,.inline button:hover{background:#242428}
+.inline{display:flex;gap:6px;margin-bottom:8px}
+.inline:last-child{margin-bottom:0}
+.inline input{flex:1;background:var(--panel2);border:1px solid var(--border);border-radius:7px;color:var(--text);font:inherit;padding:7px 10px}
+.inline input::placeholder{color:var(--muted)}
+.btn-primary{background:#2a3a66!important;border-color:var(--accent)!important;color:#dce6ff!important}
+.btn-danger{border-color:#5a2420!important;color:#ff9b91!important}
+.btn-danger:hover{background:#3a1a17!important}
+.log-wrap{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:5px}
+.log-wrap:empty::after{content:"No activity yet.";color:var(--muted)}
+.le{border-left:2px solid var(--border);padding:3px 0 3px 8px}
+.le .t{color:var(--muted);font-size:10px}
+.le .m{white-space:pre-wrap;word-break:break-word}
+.frame-wrap{background:#000;border-radius:8px;overflow:hidden;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;margin-bottom:10px}
+.frame-wrap img{max-width:100%;max-height:100%;image-rendering:pixelated;display:block}
+#noSel{color:var(--muted);padding:40px 0;text-align:center}
+@media(max-width:700px){main{grid-template-columns:1fr;grid-template-rows:auto 1fr}.sidebar{border-right:none;border-bottom:1px solid var(--border)}}
+</style></head><body>
+<header><h1>RemoteBridge Admin Panel</h1><div class="status">WebSocket: <span id="wsStatus" class="conn">connecting…</span></div></header>
+<main>
+<div class="sidebar">
+  <h2>Instances</h2>
+  <div id="instList"><div id="noInst">No instances connected.</div></div>
+</div>
+<div class="content" id="content">
+  <div id="noSel">← Select an instance to control it</div>
+  <div id="panel" style="display:none">
+    <div class="section">
+      <div class="frame-wrap"><img id="liveFrame" alt="No stream — use Watch to start"></div>
+      <div class="btnrow">
+        <button onclick="cmd('watch_start')">▶ Stream</button>
+        <button onclick="cmd('watch_stop')">⏹ Stop</button>
+        <button onclick="cmd('screenshot')">📸 Screenshot</button>
+        <button onclick="cmd('inventory_screenshot')">🎒 Inventory</button>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Info</h2>
+      <div class="btnrow">
+        <button onclick="cmd('status')">📊 Status</button>
+        <button onclick="cmd('coords')">📍 Coords</button>
+        <button onclick="cmd('gamemode')">🎮 Gamemode</button>
+        <button onclick="cmd('players')">👥 Players</button>
+        <button onclick="cmd('modlist')">📦 Mods</button>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Chat &amp; Commands</h2>
+      <div class="inline"><input id="sayIn" placeholder="chat message…"><button class="btn-primary" onclick="doSay()">💬 Say</button></div>
+      <div class="inline"><input id="cmdIn" placeholder="/command…"><button class="btn-primary" onclick="doCmd()">⚙ Run</button></div>
+    </div>
+    <div class="section">
+      <h2>Chat Relay</h2>
+      <div class="btnrow">
+        <button onclick="cmd('chat_start')">▶ All</button>
+        <button onclick="cmd('chat_stop')">⏹ All</button>
+        <button onclick="cmd('chat_in_start')">▶ In</button>
+        <button onclick="cmd('chat_in_stop')">⏹ In</button>
+        <button onclick="cmd('chat_out_start')">▶ Out</button>
+        <button onclick="cmd('chat_out_stop')">⏹ Out</button>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Connection</h2>
+      <div class="inline"><input id="joinIn" placeholder="server IP…"><button onclick="doJoin()">🌐 Join</button></div>
+      <div class="inline"><input id="kickIn" placeholder="disconnect message…"><button onclick="doKick()">👢 Kick</button></div>
+      <div class="btnrow" style="margin-top:8px">
+        <button class="btn-danger" onclick="if(confirm('Kill game?'))cmd('kill')">☠ Kill game</button>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Log</h2>
+      <div class="log-wrap" id="log"></div>
+    </div>
+  </div>
+</div>
+</main>
+<script>
+let ws, selId = null;
+const instances = new Map();
+
+function connect() {
+    ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/admin-ws');
+    ws.onopen = () => { document.getElementById('wsStatus').textContent = 'connected'; };
+    ws.onclose = () => { document.getElementById('wsStatus').textContent = 'disconnected'; setTimeout(connect,2000); };
+    ws.onerror = () => {};
+    ws.onmessage = (ev) => {
+        const m = JSON.parse(ev.data);
+        if (m.type==='instance_connected') { addInst(m.id, m.username, m.status); }
+        else if (m.type==='instance_disconnected') { removeInst(m.id); }
+        else if (m.type==='watch_frame') { if (m.id===selId) document.getElementById('liveFrame').src='data:image/jpeg;base64,'+m.data; }
+        else if (m.type==='status') { updateInstStatus(m.id, m.status); if (m.id===selId) addLog(fmtStatus(m.status)); }
+        else if (m.type==='log') { if (m.id===selId) addLog(m.text, m.image); }
+    };
+}
+
+function addInst(id, username, status) {
+    instances.set(id, { username, status });
+    renderInstList();
+}
+function removeInst(id) {
+    instances.delete(id);
+    if (selId===id) { selId=null; document.getElementById('panel').style.display='none'; document.getElementById('noSel').style.display=''; }
+    renderInstList();
+}
+function updateInstStatus(id, status) {
+    const i = instances.get(id);
+    if (i) { i.status = status; if (i.status && i.status.username) i.username = i.status.username; renderInstList(); }
+}
+function renderInstList() {
+    const el = document.getElementById('instList');
+    document.getElementById('noInst').style.display = instances.size===0?'':'none';
+    for (const [id] of instances) {
+        let tile = document.getElementById('inst-'+id);
+        if (!tile) {
+            tile = document.createElement('div');
+            tile.className='inst'; tile.id='inst-'+id;
+            tile.onclick = () => selectInst(id);
+            el.appendChild(tile);
+        }
+        const inst = instances.get(id);
+        const name = inst.username || 'connecting…';
+        const info = inst.status && inst.status.online ? (inst.status.server||'?')+' · ❤'+inst.status.health : 'not in world';
+        tile.innerHTML = '<div class="name"><span class="dot"></span>#'+id+' — '+esc(name)+'</div><div class="info">'+esc(info)+'</div>';
+        tile.classList.toggle('active', id===selId);
+    }
+    for (const el2 of el.querySelectorAll('.inst')) {
+        const id = parseInt(el2.id.replace('inst-',''));
+        if (!instances.has(id)) el2.remove();
+    }
+}
+function selectInst(id) {
+    selId = id;
+    document.getElementById('noSel').style.display='none';
+    document.getElementById('panel').style.display='';
+    document.getElementById('log').innerHTML='';
+    document.getElementById('liveFrame').src='';
+    renderInstList();
+    send({ type:'status', targetId:id });
+}
+function cmd(type) { if(!selId)return; send({ type, targetId:selId }); }
+function doSay() { const v=document.getElementById('sayIn').value.trim(); if(!v||!selId)return; send({type:'say',message:v,targetId:selId}); document.getElementById('sayIn').value=''; }
+function doCmd() { const v=document.getElementById('cmdIn').value.trim(); if(!v||!selId)return; send({type:'command',command:v,targetId:selId}); document.getElementById('cmdIn').value=''; }
+function doJoin() { const v=document.getElementById('joinIn').value.trim(); if(!v||!selId)return; send({type:'join',ip:v,targetId:selId}); document.getElementById('joinIn').value=''; }
+function doKick() { const v=document.getElementById('kickIn').value.trim()||'java.net.SocketException: Connection reset'; if(!selId)return; send({type:'kick',message:v,targetId:selId}); }
+function send(o) { if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+function addLog(text, image) {
+    const el=document.getElementById('log');
+    const e=document.createElement('div'); e.className='le';
+    e.innerHTML='<div class="t">'+new Date().toLocaleTimeString()+'</div><div class="m">'+esc(text||'')+'</div>'+(image?'<img src="data:image/jpeg;base64,'+image+'" style="max-width:100%;border-radius:5px;margin-top:4px">':'');
+    el.insertBefore(e,el.firstChild);
+    while(el.children.length>80)el.removeChild(el.lastChild);
+}
+function fmtStatus(s) { if(!s)return''; return (s.username||'?')+' · '+(s.server||'?')+' · ❤'+s.health+'/'+s.max_health+' · '+Math.round(s.x)+' '+Math.round(s.y)+' '+Math.round(s.z); }
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+['sayIn','cmdIn'].forEach(id=>document.getElementById(id).addEventListener('keydown',e=>{if(e.key==='Enter')(id==='sayIn'?doSay:doCmd)();}));
+['joinIn','kickIn'].forEach(id=>document.getElementById(id).addEventListener('keydown',e=>{if(e.key==='Enter')(id==='joinIn'?doJoin:doKick)();}));
+connect();
+</script>
+</body></html>`;
+}
+
 const PORT = process.env.PORT || 8080;
 
 const server = http.createServer((req, res) => {
@@ -608,6 +822,9 @@ const server = http.createServer((req, res) => {
         res.end(dashboardPage());
         return;
     }
+    if (url === '/admin') {
+        res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(adminPanelPage()); return;
+    }
     res.writeHead(200);
     res.end('RemoteBridge OK');
 });
@@ -619,6 +836,7 @@ const mcWss = new WebSocket.Server({ noServer: true });
 const watchWss = new WebSocket.Server({ noServer: true });
 
 const dashboardWss = new WebSocket.Server({ noServer: true });
+const adminWss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
     const url = req.url.split('?')[0];
@@ -643,6 +861,10 @@ server.on('upgrade', (req, socket, head) => {
         }
         dashboardWss.handleUpgrade(req, socket, head, (ws) => {
             dashboardWss.emit('connection', ws);
+        });
+    } else if (url === '/admin-ws') {
+        adminWss.handleUpgrade(req, socket, head, (ws) => {
+            adminWss.emit('connection', ws);
         });
     } else {
         mcWss.handleUpgrade(req, socket, head, (ws) => {
@@ -675,12 +897,46 @@ dashboardWss.on('connection', (ws) => {
     ws.on('error', () => {});
 });
 
+adminWss.on('connection', (ws) => {
+    adminViewers.add(ws);
+    // Send current instances
+    for (const [id, inst] of instances.entries()) {
+        ws.send(JSON.stringify({ type: 'instance_connected', id, username: inst.username, status: inst.lastStatus }));
+    }
+    ws.on('message', (data) => {
+        let m; try { m = JSON.parse(data.toString()); } catch (e) { return; }
+        if (!m || !m.type || m.targetId === undefined) return;
+        const id = m.targetId;
+        const inst = instances.get(id);
+        if (!inst) { ws.send(JSON.stringify({ type: 'log', id, text: '⚠️ Instance not connected.' })); return; }
+        if (m.type === 'watch_start' || m.type === 'watch_stop') {
+            if (!watchers.has(id)) watchers.set(id, new Set());
+            if (m.type === 'watch_start') watchers.get(id).add(ws);
+            else watchers.get(id).delete(ws);
+            syncWatch(id); return;
+        }
+        sendToMinecraft({ type: m.type, message: m.message, command: m.command, ip: m.ip }, id);
+    });
+    ws.on('close', () => {
+        adminViewers.delete(ws);
+        for (const [id, set] of watchers.entries()) { set.delete(ws); if (set.size===0) watchers.delete(id); syncWatch(id); }
+    });
+    ws.on('error', () => {});
+});
+
+// Forward log events to admin viewers
+const _origNotifyWatchers = notifyWatchers;
+function notifyWatchersAndAdmin(id, entry) {
+    _origNotifyWatchers(id, entry);
+    for (const v of adminViewers) {
+        if (v.readyState === WebSocket.OPEN) v.send(JSON.stringify({ type: 'log', id, ...entry }));
+    }
+}
+
 mcWss.on('error', (err) => {
-    console.error('[RemoteBridge] WebSocket server error:', err.message);
 });
 
 server.listen(PORT, () => {
-    console.log('[RemoteBridge] WebSocket server running on port ' + PORT);
 });
 
 // Keeps idle connections alive. A bot that's just sitting there AFK with no
@@ -701,7 +957,6 @@ mcWss.on('connection', (ws) => {
     const id = getNextId(); // provisional — status_response below may slide this back to an earlier number
     socketToId.set(ws, id);
     instances.set(id, { socket: ws, username: null, jarHash: null, watching: false, lastStatus: null });
-    console.log(`[RemoteBridge] Instance #${id} connected.`);
     broadcastDashboard({ type: 'instance_connected', id, username: null, status: null });
     syncWatch(id); // picks the bot up immediately if the dashboard is already open
 
@@ -716,8 +971,7 @@ mcWss.on('connection', (ws) => {
     }, 5000);
 
     ws.on('message', (data) => {
-        try { handleMinecraftPacket(JSON.parse(data.toString()), socketToId.get(ws)); }
-        catch (e) { console.warn('[RemoteBridge] Bad packet:', e.message); }
+        try { handleMinecraftPacket(JSON.parse(data.toString()), socketToId.get(ws)); } catch (e) {}
     });
 
     ws.on('close', () => {
@@ -727,7 +981,6 @@ mcWss.on('connection', (ws) => {
         const label = getLabel(id);
         instances.delete(id);
         watchKeys.delete(id);
-        console.log(`[RemoteBridge] Instance #${id} disconnected.`);
         if (mcChannel) mcChannel.send(`❌ **${label} disconnected.**`);
         broadcastDashboard({ type: 'instance_disconnected', id });
 
@@ -738,7 +991,6 @@ mcWss.on('connection', (ws) => {
         }
     });
 
-    ws.on('error', (err) => console.warn('[RemoteBridge] Socket error:', err.message));
 });
 
 // Command-panel buttons on the watch page send { kind:'action', action, ... }.
@@ -902,7 +1154,6 @@ function handleMinecraftPacket(packet, id) {
         } catch (e) {
             if (mcChannel) mcChannel.send(`${label} Failed to process screenshot.`);
             notifyWatchers(id, { text: '⚠️ Failed to process screenshot.' });
-            console.warn('[RemoteBridge] Screenshot error:', e.message);
         }
         return;
     }
@@ -945,11 +1196,12 @@ function handleMinecraftPacket(packet, id) {
                 if (v.readyState === WebSocket.OPEN && v.bufferedAmount < 1000000) v.send(msg); // drop frames for a slow viewer instead of lagging further behind
             }
         }
-        if (dashboardViewers.size > 0) {
-            const dmsg = JSON.stringify({ type: 'watch_frame', id, data: packet.data });
-            for (const v of dashboardViewers) {
-                if (v.readyState === WebSocket.OPEN && v.bufferedAmount < 1000000) v.send(dmsg);
-            }
+        const dmsg = JSON.stringify({ type: 'watch_frame', id, data: packet.data });
+        for (const v of dashboardViewers) {
+            if (v.readyState === WebSocket.OPEN && v.bufferedAmount < 1000000) v.send(dmsg);
+        }
+        for (const v of adminViewers) {
+            if (v.readyState === WebSocket.OPEN && v.bufferedAmount < 1000000) v.send(dmsg);
         }
         return;
     }
@@ -1089,7 +1341,6 @@ function handleMinecraftPacket(packet, id) {
             // Close any older duplicate connections with the same username
             for (const [otherId, otherInst] of instances.entries()) {
                 if (otherId !== id && otherInst.username === packet.username) {
-                    console.log(`[RemoteBridge] Closing duplicate instance #${otherId} for ${packet.username}`);
                     otherInst.socket.terminate();
                     instances.delete(otherId);
                 }
@@ -1162,7 +1413,6 @@ function handleMinecraftPacket(packet, id) {
         return;
     }
 
-    console.warn('[RemoteBridge] Unknown packet type:', packet.type);
 }
 
 
@@ -1243,7 +1493,6 @@ async function handleGifFrames(packet, id, label) {
         if (mcChannel) mcChannel.send({ content: `🎬 **${label} — Gameplay GIF** (${frames.length} frames)`, files: [attachment] });
         notifyWatchers(id, { text: `🎬 GIF ready (${frames.length} frames) — check Discord for the file.` });
     } catch (e) {
-        console.error('[RemoteBridge] GIF stitch error:', e.message);
         if (mcChannel) mcChannel.send(`${label} ❌ GIF failed: ${e.message}`);
         notifyWatchers(id, { text: `❌ GIF failed: ${e.message}` });
     }
@@ -1283,12 +1532,9 @@ function resolveInstance(args) {
 // ── Discord Bot ───────────────────────────────────────────────────────────────
 
 discord.once('clientReady', () => {
-    console.log('[RemoteBridge] Discord bot online as ' + discord.user.tag);
     mcChannel = discord.channels.cache.get(CHANNEL_ID);
     if (!mcChannel) {
-        console.error('[RemoteBridge] ERROR: Channel not found. Check CHANNEL_ID in .env');
     } else {
-        console.log('[RemoteBridge] Listening in #' + mcChannel.name);
     }
 });
 
@@ -1574,6 +1820,5 @@ discord.on('messageCreate', (msg) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 discord.login(DISCORD_TOKEN).catch((err) => {
-    console.error('[RemoteBridge] Failed to login:', err.message);
     process.exit(1);
 });
